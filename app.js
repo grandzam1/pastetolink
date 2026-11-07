@@ -80,7 +80,7 @@
     synced:   ["Synced to cloud", "cr-badge--ok"],
     pending:  ["Not synced yet", "cr-badge--warn"],
     offline:  ["Cloud unreachable, saved on this device", "cr-badge--warn"],
-    readonly: ["Cloud read-only (no key)", "cr-badge--muted"],
+    readonly: ["Cloud read-only (enter write token)", "cr-badge--muted"],
   };
 
   function updateBadge() {
@@ -110,6 +110,13 @@
     await pushChanges(true);
     const s = Store.status();
     toast(s === "synced" ? "Up to date" : BADGES[s] ? BADGES[s][0] : "Done");
+  });
+
+  const writeTokenInput = $("writeToken");
+  writeTokenInput.value = Cloud.getWriteToken();
+  writeTokenInput.addEventListener("input", () => {
+    Cloud.setWriteToken(writeTokenInput.value);
+    updateBadge();
   });
 
   /* ---------- LIST ---------- */
@@ -257,6 +264,7 @@
   let editor = null;
   let editId = null;
   let dirty = false;
+  let activeFile = null;
 
   function renderEdit(id) {
     let n = null;
@@ -265,8 +273,14 @@
       if (!n) return message("Note not found", "That note doesn't exist, so it can't be edited.");
     }
     editId = id;
+    activeFile = null;
     $("editHeading").textContent = id ? "Edit note" : "New note";
     $("titleInput").value = n ? n.title : "";
+    $("fileLinkPanel").classList.add("hidden");
+    $("deleteFileBtn").classList.add("hidden");
+    $("newFileBtn").classList.add("hidden");
+    $("fileFormat").disabled = false;
+    $("saveFileBtn").textContent = "Save file";
     if (!editor) {
       editor = Editor.create($("editorMount"), {
         onChange: () => { dirty = true; },
@@ -311,6 +325,154 @@
     if (dirty && !window.confirm("Discard your changes?")) return;
     dirty = false;
     location.hash = editId ? "#/" + editId : "#/";
+  });
+
+  function markdownFromHtml(html) {
+    const body = new DOMParser().parseFromString(Sanitize.clean(html), "text/html").body;
+    function inline(node) {
+      return Array.from(node.childNodes).map((child) => {
+        if (child.nodeType === 3) return child.nodeValue;
+        if (child.nodeType !== 1) return "";
+        const tag = child.tagName;
+        const text = inline(child);
+        if (tag === "BR") return "\n";
+        if (tag === "STRONG") return "**" + text + "**";
+        if (tag === "EM") return "*" + text + "*";
+        if (tag === "S") return "~~" + text + "~~";
+        if (tag === "CODE") return "`" + text.replace(/`/g, "\\`") + "`";
+        if (tag === "A") return "[" + (text || child.href) + "](" + child.href + ")";
+        return text;
+      }).join("");
+    }
+    function blocks(parent) {
+      return Array.from(parent.childNodes).map((node) => {
+        if (node.nodeType === 3) return node.nodeValue;
+        if (node.nodeType !== 1) return "";
+        const tag = node.tagName;
+        if (tag === "P") return inline(node).trim() + "\n\n";
+        if (/^H[1-3]$/.test(tag)) return "#".repeat(Number(tag.slice(1))) + " " + inline(node).trim() + "\n\n";
+        if (tag === "PRE") return "```\n" + node.textContent.replace(/\n+$/, "") + "\n```\n\n";
+        if (tag === "UL" || tag === "OL") {
+          const items = Array.from(node.children).filter((item) => item.tagName === "LI");
+          return items.map((item, index) => (tag === "OL" ? (index + 1) + ". " : "- ") + inline(item).trim()).join("\n") + "\n\n";
+        }
+        if (tag === "BLOCKQUOTE") {
+          return blocks(node).trim().split("\n").map((line) => "> " + line).join("\n") + "\n\n";
+        }
+        if (tag === "HR") return "---\n\n";
+        if (tag === "BR") return "\n";
+        return inline(node);
+      }).join("");
+    }
+    return blocks(body).trim();
+  }
+
+  function fileContent(ext) {
+    const html = editor.getHTML();
+    if (ext === "txt") return Sanitize.toText(html);
+    if (ext === "md") return markdownFromHtml(html);
+    const parsed = JSON.parse(Sanitize.toText(html));
+    return JSON.stringify(parsed, null, 2);
+  }
+
+  async function requestFile(path, method, content) {
+    const headers = { Authorization: "Bearer " + Cloud.getWriteToken() };
+    const options = { method, headers };
+    if (content !== undefined) {
+      headers["Content-Type"] = "application/json";
+      options.body = JSON.stringify(content);
+    }
+    const res = await fetch(path, options);
+    let data = {};
+    try { data = await res.json(); } catch (e) { /* show generic error */ }
+    if (!res.ok) throw new Error(data.error || "File request failed (" + res.status + ")");
+    return data;
+  }
+
+  function showFileLink(file) {
+    activeFile = file;
+    $("fileUrl").value = file.url || new URL("/files/" + file.id + "." + file.ext, location.origin).href;
+    $("fileLinkPanel").classList.remove("hidden");
+    $("fileFormat").value = file.ext;
+    $("fileFormat").disabled = true;
+    $("saveFileBtn").textContent = "Update file";
+    $("deleteFileBtn").classList.remove("hidden");
+    $("newFileBtn").classList.remove("hidden");
+  }
+
+  $("saveFileBtn").addEventListener("click", async () => {
+    if (!Cloud.getWriteToken()) { toast("Enter the write token on the notes page first."); return; }
+    if (!(window.APP_CONFIG || {}).FILES_WRITABLE) { toast("File storage and write access are not configured yet."); return; }
+    const ext = $("fileFormat").value;
+    const updating = !!activeFile;
+    let content;
+    try {
+      content = fileContent(ext);
+    } catch (error) {
+      toast(ext === "json" ? "The editor content must be valid JSON." : "Couldn't convert the editor content.");
+      return;
+    }
+    try {
+      const result = activeFile
+        ? await requestFile("/api/files?file=" + encodeURIComponent(activeFile.id + "." + activeFile.ext), "PUT", { content })
+        : await requestFile("/api/files", "POST", { ext, content });
+      showFileLink(result);
+      toast(updating ? "File updated" : "File saved");
+    } catch (error) {
+      toast(error.message || "Couldn't save the file.");
+    }
+  });
+
+  $("deleteFileBtn").addEventListener("click", async () => {
+    if (!activeFile || !window.confirm("Delete this public file? This cannot be undone.")) return;
+    try {
+      await requestFile("/api/files?file=" + encodeURIComponent(activeFile.id + "." + activeFile.ext), "DELETE");
+      activeFile = null;
+      $("fileLinkPanel").classList.add("hidden");
+      $("deleteFileBtn").classList.add("hidden");
+      $("newFileBtn").classList.add("hidden");
+      $("fileFormat").disabled = false;
+      $("saveFileBtn").textContent = "Save file";
+      toast("File deleted");
+    } catch (error) {
+      toast(error.message || "Couldn't delete the file.");
+    }
+  });
+
+  $("newFileBtn").addEventListener("click", () => {
+    if (!window.confirm("The existing file will remain published. Start another file?")) return;
+    activeFile = null;
+    $("fileLinkPanel").classList.add("hidden");
+    $("deleteFileBtn").classList.add("hidden");
+    $("newFileBtn").classList.add("hidden");
+    $("fileFormat").disabled = false;
+    $("saveFileBtn").textContent = "Save file";
+  });
+
+  $("copyFileUrlBtn").addEventListener("click", () => copy($("fileUrl").value, "Direct file URL copied"));
+
+  $("loadFileBtn").addEventListener("click", async () => {
+    let url;
+    try { url = new URL($("loadFileUrl").value.trim(), location.origin); }
+    catch (error) { toast("Paste a valid direct file URL."); return; }
+    const match = url.pathname.match(/\/files\/([a-f0-9]{16})\.(txt|json|md)$/i);
+    if (url.origin !== location.origin || !match) {
+      toast("Use a direct /files/{id}.txt, .json, or .md URL from this app.");
+      return;
+    }
+    try {
+      const res = await fetch(url.pathname, { cache: "no-store" });
+      if (!res.ok) throw new Error("File request failed (" + res.status + ")");
+      const content = await res.text();
+      const ext = match[2].toLowerCase();
+      if (ext === "json") JSON.parse(content);
+      editor.setHTML(Sanitize.textToHtml(content));
+      dirty = false;
+      showFileLink({ id: match[1].toLowerCase(), ext, url: url.href });
+      toast("File loaded. Save updates it; Delete removes it.");
+    } catch (error) {
+      toast(error instanceof SyntaxError ? "The file contains invalid JSON." : (error.message || "Couldn't load the file."));
+    }
   });
 
   document.addEventListener("keydown", (e) => {

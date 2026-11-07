@@ -39,14 +39,11 @@
     }
   }
 
-  // Cloud bin first (no key needed for a public bin), then the project's notes.json
+  // Same-origin API first, then the project's static notes.json fallback
   async function projectNote(id) {
-    const bin = String((window.APP_CONFIG || {}).BIN_ID || "").trim();
-    if (/^[A-Za-z0-9]{10,40}$/.test(bin)) {
-      const list = await fetchList("https://api.jsonbin.io/v3/b/" + bin + "/latest", true);
-      const hit = list && list.find((n) => n && n.id === id);
-      if (hit) return hit;
-    }
+    const cloud = await fetchList("/api/notes", true);
+    const cloudHit = cloud && cloud.find((n) => n && n.id === id);
+    if (cloudHit) return cloudHit;
     const list = await fetchList("notes.json");
     return (list && list.find((n) => n && n.id === id)) || null;
   }
